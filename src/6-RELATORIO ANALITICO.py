@@ -8,6 +8,14 @@ Gera um relatório PDF analítico inteligente POR PROJETO, com:
   - Análise de tendência temporal (backlog)
   - Segmentação Segurança vs Qualidade
   - Destaques críticos e recomendações
+
+CORREÇÕES APLICADAS:
+  - ler_api_key() lê de variável de ambiente (DEEPSEEK_API_KEY ou OPENAI_API_KEY)
+  - canvas.drawImage usa ImageReader (não RLImage/Flowable)
+  - DeepSeek base_url corrigida para https://api.deepseek.com/v1
+  - numpy adicionado ao requirements.txt
+  - Flags booleanas DOCX_DISPONIVEL / PYPDF2_DISPONIVEL substituem globals()
+  - Variáveis por_mes e mttr_global repassadas via kpi_context sem depender de locals()
 """
 
 import os
@@ -20,6 +28,7 @@ import pandas as pd
 import numpy as np
 import openai
 
+# ─── ReportLab ───────────────────────────────────────────────────────────────
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
@@ -29,49 +38,71 @@ try:
                                     KeepTogether, Image as RLImage)
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
+    # FIX: ImageReader é necessário para canvas.drawImage com BytesIO
+    from reportlab.lib.utils import ImageReader
 except ImportError:
     print("\nERRO: pip install reportlab\n")
     import sys; sys.exit(1)
 
+# ─── python-docx ─────────────────────────────────────────────────────────────
+# FIX: usar flag booleana em vez de checar globals()
+DOCX_DISPONIVEL = False
 try:
     from docx import Document
     from docx.shared import Inches, Pt, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    DOCX_DISPONIVEL = True
 except ImportError:
     print("\nAVISO: pip install python-docx para gerar arquivos Word (.docx)\n")
 
+# ─── PyPDF2 ──────────────────────────────────────────────────────────────────
+# FIX: usar flag booleana em vez de checar globals()
+PYPDF2_DISPONIVEL = False
 try:
     from PyPDF2 import PdfWriter, PdfReader
+    PYPDF2_DISPONIVEL = True
 except ImportError:
     print("\nAVISO: pip install PyPDF2 para anexar relatórios PDF\n")
 
+# ─── Pillow ──────────────────────────────────────────────────────────────────
 try:
     from PIL import Image
     from io import BytesIO
+    PILLOW_DISPONIVEL = True
 except ImportError:
     print("\nAVISO: pip install pillow para compressão de imagens\n")
     Image = None
     BytesIO = None
+    PILLOW_DISPONIVEL = False
 
 PASTA_RELATORIOS = "relatorios_analiticos"
 PASTA_GRAFICOS   = "graficos_snagr"
 
+
+# ─── FIX: ler_api_key lê de variável de ambiente ─────────────────────────────
 def ler_api_key():
-    # Chave fornecida diretamente
-    return "sk-b61c50e39d2544e68b5ffca511e59796"
+    """
+    Lê a chave de API da variável de ambiente.
+    Tenta DEEPSEEK_API_KEY primeiro; depois OPENAI_API_KEY como fallback.
+    """
+    chave = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not chave:
+        print("AVISO: nenhuma chave de API encontrada nas variáveis de ambiente "
+              "(DEEPSEEK_API_KEY ou OPENAI_API_KEY).")
+    return chave
+
 
 API_KEY = ler_api_key()
 CLIENT_OPENAI = None
 
 if API_KEY:
     with open("start_log.txt", "a") as f:
-        f.write(f"API Key loaded: {API_KEY[:5]}\n")
+        f.write(f"API Key loaded: {API_KEY[:5]}...\n")
     try:
-        # Configuração para DeepSeek (compatível com OpenAI)
-        # Ajuste a base_url se necessário. DeepSeek geralmente usa https://api.deepseek.com/v1
+        # FIX: base_url corrigida para incluir /v1
         CLIENT_OPENAI = openai.OpenAI(
             api_key=API_KEY,
-            base_url="https://api.deepseek.com",
+            base_url="https://api.deepseek.com/v1",
             timeout=60.0
         )
         with open("start_log.txt", "a") as f:
@@ -82,7 +113,7 @@ else:
     with open("start_log.txt", "a") as f:
         f.write("API Key NOT found\n")
 
-# ─── Cores ──────────────────────────────────────────────────────────────────
+# ─── Cores ───────────────────────────────────────────────────────────────────
 COR_PRIM    = colors.HexColor("#01455C")
 COR_VERDE   = colors.HexColor("#00e676")
 COR_VERM    = colors.HexColor("#ff5252")
@@ -90,33 +121,44 @@ COR_CINZA_L = colors.HexColor("#eceff1")
 COR_CINZA_M = colors.HexColor("#b0bec5")
 BRANCO      = colors.white
 
-# ─── Palavras-chave de segurança ────────────────────────────────────────────
+# ─── Palavras-chave de segurança ─────────────────────────────────────────────
 KW_SEG = ['segurança', 'epi', 'epc', 'cipa', 'risco', 'acidente',
           'seguranca', 'sinaliza', 'queda', 'higiene', 'sst']
+
 
 def classificar_tipo(item):
     txt = f"{item.get('Category','')} {item.get('Defect','')} {item.get('ShortDescrip','')}".lower()
     return 'Segurança' if any(k in txt for k in KW_SEG) else 'Qualidade'
 
+
 def agrupar_status(s):
     s = str(s or '').strip()
-    if s in ['Fixed','Closed','Fechado','Corrigido','Aprovado']: return 'Corrigido'
-    if s in ['SignedOff','Verificado']: return 'Verificado'
-    if s in ['NotADefect','Recusado','Não Aceito']: return 'Não Aceito'
+    if s in ['Fixed', 'Closed', 'Fechado', 'Corrigido', 'Aprovado']:
+        return 'Corrigido'
+    if s in ['SignedOff', 'Verificado']:
+        return 'Verificado'
+    if s in ['NotADefect', 'Recusado', 'Não Aceito']:
+        return 'Não Aceito'
     return 'Sem Correção'
 
+
 def parse_data(s):
-    if not s or pd.isna(s): return None
+    if not s or pd.isna(s):
+        return None
     try:
-        if 'T' in str(s): return pd.to_datetime(str(s))
-        if '/' in str(s): return pd.to_datetime(str(s), format='%d/%m/%Y %H:%M:%S')
-    except: pass
+        if 'T' in str(s):
+            return pd.to_datetime(str(s))
+        if '/' in str(s):
+            return pd.to_datetime(str(s), format='%d/%m/%Y %H:%M:%S')
+    except Exception:
+        pass
     return None
 
-# ─── Integração LLM DeepSeek ────────────────────────────────────────────────
+
+# ─── Integração LLM DeepSeek ─────────────────────────────────────────────────
 def consultar_llm(contexto):
     """
-    Envia o contexto estatístico para o DeepSeek Reasoner e retorna a análise em JSON.
+    Envia o contexto estatístico para o DeepSeek e retorna a análise em JSON.
     """
     if not CLIENT_OPENAI:
         return None
@@ -126,7 +168,7 @@ Sua tarefa é analisar os dados estatísticos fornecidos e gerar os textos para 
 
 Diretrizes Gerais:
 1. Autonomia Analítica: Não se limite a descrever os números. Interprete-os, identifique tendências ocultas, correlações e padrões.
-2. Contextualização: Este documento tem uma estrutura análitica, com pricipios da observabilidade.No Resumo Executivo, contextualize a situação do projeto de forma abrangente.
+2. Contextualização: Este documento tem uma estrutura analítica, com princípios da observabilidade. No Resumo Executivo, contextualize a situação do projeto de forma abrangente.
 3. Proatividade: Na Conclusão, proponha planos de ação concretos, sugira focos de atuação.
 4. Ferramentas da Qualidade: Caso identifique padrões relevantes, não sugira ferramentas da qualidade, seja propositivo de maneira genérica e didática, como uma oportunidade de melhoria.
 5. Tom de Voz:
@@ -140,19 +182,19 @@ Formato de Saída:
 - Use tags HTML simples (<b>, <i>, <br/>) para formatação.
 - NÃO use markdown (```) dentro dos valores do JSON.
 - NÃO mencione que este texto foi gerado por uma IA.
-- NÃO mencione empreiteira utilize empresa resposável
+- NÃO mencione empreiteira — utilize "empresa responsável".
 - Quando da análise houver menção a BENX ou BN, modere os termos e adjetivos.
 - Não citar pós obra dando a entender que o projeto está acabando.
 - Evite termos em inglês, use português.
 Estrutura do JSON:
 {
-  "resumo": "Resumo executivo contextualizado, apresentando o cenário global do projeto, explique os termos e conceitos utilizados...",
+  "resumo": "Resumo executivo contextualizado...",
   "segmentacao": "Análise crítica da divisão entre Segurança e Qualidade...",
-  "cat_resumo": "Síntese do desempenho por categorias, destacando ofensores e áreas de excelência...",
-  "tendencia": "Análise da evolução temporal (backlog), identificando se o ritmo de fechamento acompanha a abertura...",
-  "sla": "Análise da eficiência da equipe (MTTR), criticando tempos elevados se houver...",
-  "causa_raiz_insights": "Interpretação qualitativa e estratégica dos padrões de causa raiz identificados (NÃO repita os dados, apenas analise e sugira soluções)...",
-  "conclusao_final": "Conclusão estratégica abrangente, com recomendações de curto e médio prazo, focando na melhoria contínua e não repetição dos problemas."
+  "cat_resumo": "Síntese do desempenho por categorias...",
+  "tendencia": "Análise da evolução temporal (backlog)...",
+  "sla": "Análise da eficiência da equipe (MTTR)...",
+  "causa_raiz_insights": "Interpretação qualitativa e estratégica dos padrões...",
+  "conclusao_final": "Conclusão estratégica abrangente..."
 }
 """
 
@@ -166,21 +208,21 @@ Gere os textos analíticos conforme as diretrizes."""
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": prompt_sistema},
-                {"role": "user", "content": prompt_usuario}
+                {"role": "user",   "content": prompt_usuario}
             ],
             stream=False
         )
         content = response.choices[0].message.content
-        # Tentar extrair JSON caso venha com markdown ```json ... ```
+        # Extrair JSON caso venha embrulhado em markdown
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0]
         elif "```" in content:
             content = content.split("```")[1].split("```")[0]
-            
         return json.loads(content.strip())
     except Exception as e:
         print(f"Erro na consulta ao LLM: {e}")
         return None
+
 
 # ─── Estilos ──────────────────────────────────────────────────────────────────
 def estilos():
@@ -202,6 +244,7 @@ def estilos():
                                   textColor=COR_CINZA_M, alignment=TA_CENTER),
     }
 
+
 # ─── Geração de Textos Analíticos ────────────────────────────────────────────
 def gerar_analise(df, nome_projeto):
     """Retorna um dicionário de strings com as análises textuais."""
@@ -209,9 +252,9 @@ def gerar_analise(df, nome_projeto):
     st = estilos()
     analise = {}
 
-    # 1. Status geral
+    # ── 1. Status geral ──────────────────────────────────────────────────────
     df['StatusAg'] = df['FixStatus_Ref'].apply(agrupar_status)
-    contagem = df['StatusAg'].value_counts()
+    contagem   = df['StatusAg'].value_counts()
     corrigido  = contagem.get('Corrigido', 0)
     verificado = contagem.get('Verificado', 0)
     sem_corr   = contagem.get('Sem Correção', 0)
@@ -246,10 +289,10 @@ def gerar_analise(df, nome_projeto):
             "Ação imediata é necessária."
         )
 
-    # 2. Segmentação Segurança vs Qualidade
+    # ── 2. Segmentação Segurança vs Qualidade ────────────────────────────────
     df['Tipo'] = df.apply(lambda r: classificar_tipo(r), axis=1)
     tipo_counts = df['Tipo'].value_counts()
-    n_seg = tipo_counts.get('Segurança', 0)
+    n_seg  = tipo_counts.get('Segurança', 0)
     n_qual = tipo_counts.get('Qualidade', 0)
     pct_seg = n_seg / total * 100 if total else 0
 
@@ -257,33 +300,38 @@ def gerar_analise(df, nome_projeto):
         f"Do total de apontamentos, <b>{n_qual}</b> são de <b>Qualidade</b> ({n_qual/total*100:.1f}%) e "
         f"<b>{n_seg}</b> são de <b>Segurança</b> ({pct_seg:.1f}%). "
     )
-    # Resolução por tipo
     for tipo in ['Qualidade', 'Segurança']:
         df_t = df[df['Tipo'] == tipo]
-        if df_t.empty: continue
-        st_t = df_t['StatusAg'].value_counts()
+        if df_t.empty:
+            continue
+        st_t  = df_t['StatusAg'].value_counts()
         res_t = st_t.get('Corrigido', 0) + st_t.get('Verificado', 0)
         pct_t = res_t / len(df_t) * 100
         analise['segmentacao'] += (
             f"A taxa de resolução de <b>{tipo}</b> é de <b>{pct_t:.1f}%</b> ({res_t}/{len(df_t)}). "
         )
 
-    # 3. Análise por Categoria e Subcategorias (unificado)
+    # ── 3. Análise por Categoria e Subcategorias ─────────────────────────────
     cat_counts = df['Category'].value_counts()
-    top_cats = cat_counts.head(8)  # até 8 categorias mais relevantes
+    top_cats   = cat_counts.head(8)
     blocos_cat = []
 
+    cats_sig = df.groupby('Category').agg(
+        total=('SnagID', 'count'),
+        resolvidos=('StatusAg', lambda x: x.isin(['Corrigido', 'Verificado']).sum())
+    )
+    cats_sig['pct'] = cats_sig['resolvidos'] / cats_sig['total'] * 100
+
     for cat, n_cat in top_cats.items():
-        df_cat = df[df['Category'] == cat]
-        res_cat = df_cat['StatusAg'].isin(['Corrigido', 'Verificado']).sum()
-        pct_cat = res_cat / n_cat * 100
+        df_cat   = df[df['Category'] == cat]
+        res_cat  = df_cat['StatusAg'].isin(['Corrigido', 'Verificado']).sum()
+        pct_cat  = res_cat / n_cat * 100
         pend_cat = n_cat - res_cat
 
-        # Subcategorias dentro desta categoria
         sub_counts = df_cat['Defect'].value_counts()
         linhas_sub = []
         for defect, n_def in sub_counts.items():
-            df_def = df_cat[df_cat['Defect'] == defect]
+            df_def  = df_cat[df_cat['Defect'] == defect]
             res_def = df_def['StatusAg'].isin(['Corrigido', 'Verificado']).sum()
             pct_def = res_def / n_def * 100 if n_def else 0
             linhas_sub.append(
@@ -291,7 +339,6 @@ def gerar_analise(df, nome_projeto):
                 f"({res_def} resolvidos — {pct_def:.0f}%)"
             )
 
-        # Avaliação da categoria
         if pct_cat >= 70:
             avaliacao = "Desempenho satisfatório."
         elif pct_cat >= 40:
@@ -307,12 +354,6 @@ def gerar_analise(df, nome_projeto):
         )
         blocos_cat.append(bloco)
 
-    # Categoria mais crítica
-    cats_sig = df.groupby('Category').agg(
-        total=('SnagID', 'count'),
-        resolvidos=('StatusAg', lambda x: x.isin(['Corrigido', 'Verificado']).sum())
-    )
-    cats_sig['pct'] = cats_sig['resolvidos'] / cats_sig['total'] * 100
     cats_criticas = cats_sig[cats_sig['total'] >= 5].sort_values('pct')
     alerta = ""
     if not cats_criticas.empty:
@@ -325,19 +366,15 @@ def gerar_analise(df, nome_projeto):
 
     analise['categorias'] = "<br/><br/>".join(blocos_cat) + alerta
 
-    # ── Texto introdutório e resumo da seção 4 ──
     n_cats = len(top_cats)
     analise['cat_intro'] = (
         f"O gráfico a seguir apresenta a distribuição de apontamentos por "
         f"<b>categoria</b> e suas respectivas <b>subcategorias (defeitos)</b>. "
         f"Para cada categoria, as barras horizontais representam o volume de ocorrências "
         f"por subcategoria, segmentado em <b>resolvidos</b> (verde) e <b>pendentes</b> "
-        f"(salmão). O comprimento da barra é proporcional ao item com maior volume de "
-        f"ocorrências dentro da categoria. Ao total, {n_cats} categorias mais relevantes "
-        f"são apresentadas."
+        f"(salmão). Ao total, {n_cats} categorias mais relevantes são apresentadas."
     )
 
-    # Resumo pós-gráfico
     melhor_cat = cats_sig.sort_values('pct', ascending=False).iloc[0] if not cats_sig.empty else None
     txt_resumo = (
         f"<b>Resumo da Análise por Categorias:</b><br/><br/>"
@@ -358,7 +395,7 @@ def gerar_analise(df, nome_projeto):
             f"({int(pior['resolvidos'])}/{int(pior['total'])}), "
             f"demandando atenção prioritária da gestão."
         )
-    # Distribuição de avaliações
+
     n_satisf = int((cats_sig['pct'] >= 70).sum())
     n_moder  = int(((cats_sig['pct'] >= 40) & (cats_sig['pct'] < 70)).sum())
     n_crit   = int((cats_sig['pct'] < 40).sum())
@@ -369,25 +406,30 @@ def gerar_analise(df, nome_projeto):
     )
     analise['cat_resumo'] = txt_resumo
 
-    # 5. Tendência temporal
+    # ── 5. Tendência temporal ─────────────────────────────────────────────────
     df['Spotted_dt'] = df['Spotted'].apply(parse_data)
     df_com_data = df.dropna(subset=['Spotted_dt'])
+
+    # FIX: armazenar por_mes como variável do escopo da função para repassar ao LLM
+    por_mes_result = None
+    media_mensal   = None
+
     if not df_com_data.empty:
         por_mes = df_com_data.set_index('Spotted_dt').resample('ME').size()
+        por_mes_result = por_mes
         if len(por_mes) >= 2:
-            ultimo_mes = por_mes.iloc[-1]
-            penultimo  = por_mes.iloc[-2]
-            media      = por_mes.mean()
+            ultimo_mes  = por_mes.iloc[-1]
+            penultimo   = por_mes.iloc[-2]
+            media       = por_mes.mean()
+            media_mensal = media
             nome_ultimo    = por_mes.index[-1].strftime('%B/%Y')
             nome_penultimo = por_mes.index[-2].strftime('%B/%Y')
 
-            # ── Mês atual ──
             tendencia = (
                 f"<b>Mês atual — {nome_ultimo}:</b> Foram registrados "
                 f"<b>{ultimo_mes} apontamentos</b> neste período. "
             )
 
-            # ── Comparação com mês anterior ──
             if penultimo > 0:
                 var_pct = ((ultimo_mes - penultimo) / penultimo) * 100
                 if var_pct > 0:
@@ -395,17 +437,12 @@ def gerar_analise(df, nome_projeto):
                         f"Em comparação com o mês anterior ({nome_penultimo}), que teve "
                         f"<b>{penultimo} apontamentos</b>, houve um "
                         f"<font color='#ff5252'><b>aumento de {var_pct:.0f}%</b></font>. "
-                        f"O crescimento no volume de apontamentos indica possível "
-                        f"aceleração na identificação de não-conformidades ou "
-                        f"aumento real de defeitos."
                     )
                 elif var_pct < 0:
                     tendencia += (
                         f"Em comparação com o mês anterior ({nome_penultimo}), que teve "
                         f"<b>{penultimo} apontamentos</b>, houve uma "
                         f"<font color='#00c853'><b>redução de {abs(var_pct):.0f}%</b></font>. "
-                        f"A queda pode indicar melhoria nos processos construtivos "
-                        f"ou redução no ritmo de inspeções."
                     )
                 else:
                     tendencia += (
@@ -414,22 +451,18 @@ def gerar_analise(df, nome_projeto):
                     )
             else:
                 tendencia += (
-                    f"O mês anterior ({nome_penultimo}) não possuía registros "
-                    f"para comparação direta."
+                    f"O mês anterior ({nome_penultimo}) não possuía registros para comparação direta."
                 )
 
-            # ── Tendência geral vs média ──
             if ultimo_mes > media * 1.3:
                 tendencia += (
                     f"<br/><br/>O mês atual está <b>acima da média mensal de "
-                    f"{media:.0f} apontamentos</b>. A tendência é crescente — "
-                    f"o volume de problemas está aumentando."
+                    f"{media:.0f} apontamentos</b>. A tendência é crescente."
                 )
             elif ultimo_mes < media * 0.7:
                 tendencia += (
                     f"<br/><br/>O mês atual está <b>abaixo da média mensal de "
-                    f"{media:.0f} apontamentos</b>. A tendência é de queda — "
-                    f"o ritmo de novos problemas está desacelerando."
+                    f"{media:.0f} apontamentos</b>. A tendência é de queda."
                 )
             else:
                 tendencia += (
@@ -437,24 +470,22 @@ def gerar_analise(df, nome_projeto):
                     f"{media:.0f} apontamentos</b>. A tendência é estável."
                 )
 
-            # Período com mais apontamentos
             pico = por_mes.idxmax()
             tendencia += (
                 f"<br/><br/>O pico de apontamentos ocorreu em <b>{pico.strftime('%B/%Y')}</b> "
                 f"com <b>{por_mes.max()}</b> registros."
             )
 
-            # ── Histórico acumulado e volume de correção ──
-            total_meses = len(por_mes)
-            primeiro_mes = por_mes.index[0].strftime('%B/%Y')
-            total_abertos  = int(por_mes.sum())
-            # Correções ao longo do tempo
+            total_meses   = len(por_mes)
+            primeiro_mes  = por_mes.index[0].strftime('%B/%Y')
+            total_abertos = int(por_mes.sum())
+
             df_res = df[df['StatusAg'].isin(['Corrigido', 'Verificado'])].copy()
             df_res['LastChanged_dt2'] = df_res['LastChanged'].apply(parse_data)
             df_res_data = df_res.dropna(subset=['LastChanged_dt2'])
             if not df_res_data.empty:
-                corr_mes = df_res_data.set_index('LastChanged_dt2').resample('ME').size()
-                media_corr = corr_mes.mean()
+                corr_mes       = df_res_data.set_index('LastChanged_dt2').resample('ME').size()
+                media_corr     = corr_mes.mean()
                 total_corrigidos = int(corr_mes.sum())
                 tendencia += (
                     f"<br/><br/><b>Histórico acumulado:</b> Desde <b>{primeiro_mes}</b>, "
@@ -466,23 +497,21 @@ def gerar_analise(df, nome_projeto):
                 if media_corr >= media:
                     tendencia += (
                         f"O ritmo de correção (<b>{media_corr:.0f}/mês</b>) é "
-                        f"igual ou superior ao de abertura (<b>{media:.0f}/mês</b>), "
-                        f"indicando que a equipe está conseguindo acompanhar a demanda."
+                        f"igual ou superior ao de abertura (<b>{media:.0f}/mês</b>)."
                     )
                 else:
                     deficit = media - media_corr
                     tendencia += (
                         f"O ritmo de correção (<b>{media_corr:.0f}/mês</b>) está "
                         f"abaixo do de abertura (<b>{media:.0f}/mês</b>), "
-                        f"gerando um acúmulo estimado de <b>{deficit:.0f} itens/mês</b> "
-                        f"no passivo pendente. Ação de reforço é recomendada."
+                        f"gerando um acúmulo estimado de <b>{deficit:.0f} itens/mês</b>. "
+                        f"Ação de reforço é recomendada."
                     )
             else:
                 tendencia += (
                     f"<br/><br/><b>Histórico acumulado:</b> Desde <b>{primeiro_mes}</b>, "
                     f"ao longo de <b>{total_meses} meses</b>, foram registrados "
-                    f"<b>{total_abertos} apontamentos</b>. Dados de correção "
-                    f"insuficientes para análise do volume de resolução ao longo do tempo."
+                    f"<b>{total_abertos} apontamentos</b>. Dados de correção insuficientes."
                 )
 
             analise['tendencia'] = tendencia
@@ -491,19 +520,23 @@ def gerar_analise(df, nome_projeto):
     else:
         analise['tendencia'] = "Sem datas de abertura disponíveis para análise temporal."
 
-    # 8. SLA / Tempo de Resposta (MTTR)
+    # ── 8. SLA / Tempo de Resposta (MTTR) ────────────────────────────────────
     df['LastChanged_dt'] = df['LastChanged'].apply(parse_data)
     df_sla = df.dropna(subset=['Spotted_dt', 'LastChanged_dt']).copy()
+
+    # FIX: armazenar mttr_global no escopo da função
+    mttr_global_result = None
+
     if not df_sla.empty:
         df_sla['SLA_dias'] = (df_sla['LastChanged_dt'] - df_sla['Spotted_dt']).dt.days
 
-        # MTTR global
-        mttr_global = df_sla['SLA_dias'].mean()
-        mediana_global = df_sla['SLA_dias'].median()
-        maximo = df_sla['SLA_dias'].max()
+        mttr_global      = df_sla['SLA_dias'].mean()
+        mttr_global_result = mttr_global
+        mediana_global   = df_sla['SLA_dias'].median()
+        maximo           = df_sla['SLA_dias'].max()
 
         txt_sla = (
-            "A análise de <b>SLA (Service Level Agreement)</b> e <b>MTTR (Mean Time To Repair)</b> "
+            "A análise de <b>SLA (Acordo de Nível de Serviço)</b> e <b>MTTR (Tempo Médio para Reparo)</b> "
             "é fundamental para medir a eficiência da equipe na resolução dos problemas identificados. "
             "O SLA define o compromisso de tempo para a tratativa, enquanto o MTTR reflete a média real "
             "de dias que um apontamento leva para ser concluído, desde sua abertura até a última interação.<br/><br/>"
@@ -511,82 +544,67 @@ def gerar_analise(df, nome_projeto):
             f"<b>{mttr_global:.0f} dias</b> (mediana: {mediana_global:.0f} dias, máximo: {maximo} dias)."
         )
 
-        # MTTR por categoria (top 5) - Preparar dados para tabela
         sla_cat_data = []
         sla_cat = df_sla.groupby('Category')['SLA_dias'].agg(['mean', 'median', 'count'])
         sla_cat = sla_cat[sla_cat['count'] >= 3].sort_values('mean', ascending=False).head(5)
         if not sla_cat.empty:
             for cat, row in sla_cat.iterrows():
-                alerta_sla = ""
-                if row['mean'] > 60:
-                    alerta_sla = "Crítico"
-                elif row['mean'] > 30:
-                    alerta_sla = "Atenção"
+                alerta_sla = "Crítico" if row['mean'] > 60 else ("Atenção" if row['mean'] > 30 else "")
                 sla_cat_data.append({
                     'Categoria': cat,
-                    'Média': f"{row['mean']:.0f} dias",
+                    'Média':   f"{row['mean']:.0f} dias",
                     'Mediana': f"{row['median']:.0f} dias",
-                    'Qtd': int(row['count']),
-                    'Status': alerta_sla
+                    'Qtd':     int(row['count']),
+                    'Status':  alerta_sla
                 })
 
-        # MTTR por grupo/empreiteira (top 5) - Preparar dados para tabela
         sla_grp_data = []
         sla_grp = df_sla.groupby('Groupname')['SLA_dias'].agg(['mean', 'median', 'count'])
         sla_grp = sla_grp[sla_grp['count'] >= 3].sort_values('mean', ascending=False).head(5)
         if not sla_grp.empty:
             for grp, row in sla_grp.iterrows():
-                alerta_sla = ""
-                if row['mean'] > 60:
-                    alerta_sla = "Crítico"
-                elif row['mean'] > 30:
-                    alerta_sla = "Atenção"
+                alerta_sla = "Crítico" if row['mean'] > 60 else ("Atenção" if row['mean'] > 30 else "")
                 sla_grp_data.append({
-                    'Grupo': grp,
-                    'Média': f"{row['mean']:.0f} dias",
+                    'Grupo':   grp,
+                    'Média':   f"{row['mean']:.0f} dias",
                     'Mediana': f"{row['median']:.0f} dias",
-                    'Qtd': int(row['count']),
-                    'Status': alerta_sla
+                    'Qtd':     int(row['count']),
+                    'Status':  alerta_sla
                 })
 
-        # Itens abertos há mais tempo (Top 20 para tabela)
-        df_pendentes = df_sla[df_sla['StatusAg'] == 'Sem Correção'].copy()
+        df_pendentes    = df_sla[df_sla['StatusAg'] == 'Sem Correção'].copy()
         top_antigos_data = []
         if not df_pendentes.empty:
             df_pendentes['Dias_aberto'] = (pd.Timestamp.now() - df_pendentes['Spotted_dt']).dt.days
             top_antigos = df_pendentes.nlargest(20, 'Dias_aberto')
-            
             for _, row in top_antigos.iterrows():
                 top_antigos_data.append({
-                    'ID': row.get('SnagID', ''),
-                    'Dias': row['Dias_aberto'],
+                    'ID':       row.get('SnagID', ''),
+                    'Dias':     row['Dias_aberto'],
                     'Categoria': row.get('Category', ''),
-                    'Defeito': row.get('Defect', ''),
-                    'Local': row.get('Location', '')
+                    'Defeito':  row.get('Defect', ''),
+                    'Local':    row.get('Location', '')
                 })
 
-        analise['sla'] = txt_sla
+        analise['sla']          = txt_sla
         analise['sla_cat_data'] = sla_cat_data
         analise['sla_grp_data'] = sla_grp_data
-        analise['top_antigos'] = top_antigos_data
+        analise['top_antigos']  = top_antigos_data
     else:
-        analise['sla'] = "Dados insuficientes para cálculo de SLA (datas ausentes)."
+        analise['sla']          = "Dados insuficientes para cálculo de SLA (datas ausentes)."
         analise['sla_cat_data'] = []
         analise['sla_grp_data'] = []
-        analise['top_antigos'] = []
+        analise['top_antigos']  = []
 
-
-    # 9. Análise de Causa Raiz (Heurística Nativa)
+    # ── 9. Análise de Causa Raiz ──────────────────────────────────────────────
     causas = []
-    
+
     analise['causa_raiz_intro'] = (
         "A <b>Análise de Causa Raiz</b> é uma forma prática de olhar para os dados e entender "
         "o que está se repetindo com mais frequência — ou seja, onde os problemas tendem a voltar."
         "<br/><br/>"
-        "Nesta seção, a ideia não é só apontar “qual foi o defeito”, mas enxergar padrões de "
-        "reincidência entre a empresa responsável, o tipo de apontamento e os locais mais afetados. "
-        "Com isso, fica mais fácil direcionar ações que ataquem a origem do problema e reduzam a "
-        "repetição ao longo do tempo."
+        "Nesta seção, a ideia não é só apontar 'qual foi o defeito', mas enxergar padrões de "
+        "reincidência entre a empresa responsável, o tipo de apontamento e os locais mais afetados."
     )
 
     # 9a. Concentração: Empreiteira × Defeito
@@ -596,7 +614,7 @@ def gerar_analise(df, nome_projeto):
         if not cross_gd.empty:
             linhas_gd = []
             for _, row in cross_gd.iterrows():
-                df_sub = df[(df['Groupname'] == row['Groupname']) & (df['Defect'] == row['Defect'])]
+                df_sub  = df[(df['Groupname'] == row['Groupname']) & (df['Defect'] == row['Defect'])]
                 res_sub = df_sub['StatusAg'].isin(['Corrigido', 'Verificado']).sum()
                 pct_sub = res_sub / row['qtd'] * 100
                 linhas_gd.append(
@@ -604,9 +622,8 @@ def gerar_analise(df, nome_projeto):
                     f"{row['qtd']} ocorrências ({pct_sub:.0f}% resolvidos)"
                 )
             causas.append(
-                "<b>Concentração Empreiteira × Defeito:</b> Algumas combinações "
-                "de empreiteira e tipo de defeito se repetem sistematicamente, "
-                "indicando possível falha de método ou capacitação:<br/>"
+                "<b>Concentração Empresa × Defeito:</b> Algumas combinações "
+                "de empresa responsável e tipo de defeito se repetem sistematicamente:<br/>"
                 + "<br/>".join(linhas_gd)
             )
 
@@ -624,52 +641,45 @@ def gerar_analise(df, nome_projeto):
                 )
             causas.append(
                 "<b>Concentração Localização × Categoria:</b> Determinadas áreas "
-                "acumulam defeitos de mesma natureza, sugerindo causa sistêmica "
-                "(material, projeto ou mão de obra local):<br/>"
+                "acumulam defeitos de mesma natureza:<br/>"
                 + "<br/>".join(linhas_lc)
             )
 
     # 9c. Defeitos crônicos (abertos > 90 dias, sem correção)
-    if 'Spotted_dt' in df.columns:
-        df_cronicos = df[(df['StatusAg'] == 'Sem Correção')].copy()
-        df_cronicos['Spotted_dt2'] = df_cronicos['Spotted'].apply(parse_data)
-        df_cronicos = df_cronicos.dropna(subset=['Spotted_dt2'])
-        if not df_cronicos.empty:
-            df_cronicos['Dias'] = (pd.Timestamp.now() - df_cronicos['Spotted_dt2']).dt.days
-            cronicos = df_cronicos[df_cronicos['Dias'] > 90]
-            if len(cronicos) > 0:
-                # Agrupar por categoria
-                cron_cat = cronicos['Category'].value_counts().head(5)
-                linhas_cron = [
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;• <b>{cat}</b>: {n} itens crônicos (> 90 dias sem correção)"
-                    for cat, n in cron_cat.items()
-                ]
-                causas.append(
-                    f"<b>Defeitos Crônicos ({len(cronicos)} itens):</b> "
-                    f"Apontamentos abertos há mais de 90 dias sem tratativa indicam "
-                    "problemas estruturais de gestão — falta de responsável, "
-                    "indefinição técnica ou abandono do acompanhamento:<br/>"
-                    + "<br/>".join(linhas_cron)
-                )
+    df_cronicos = df[df['StatusAg'] == 'Sem Correção'].copy()
+    df_cronicos['Spotted_dt2'] = df_cronicos['Spotted'].apply(parse_data)
+    df_cronicos = df_cronicos.dropna(subset=['Spotted_dt2'])
+    if not df_cronicos.empty:
+        df_cronicos['Dias'] = (pd.Timestamp.now() - df_cronicos['Spotted_dt2']).dt.days
+        cronicos = df_cronicos[df_cronicos['Dias'] > 90]
+        if len(cronicos) > 0:
+            cron_cat   = cronicos['Category'].value_counts().head(5)
+            linhas_cron = [
+                f"&nbsp;&nbsp;&nbsp;&nbsp;• <b>{cat}</b>: {n} itens crônicos (> 90 dias sem correção)"
+                for cat, n in cron_cat.items()
+            ]
+            causas.append(
+                f"<b>Defeitos Crônicos ({len(cronicos)} itens):</b> "
+                f"Apontamentos abertos há mais de 90 dias sem tratativa:<br/>"
+                + "<br/>".join(linhas_cron)
+            )
 
-    # 9d. Reincidência temporal (mesma subcategoria aparece em >3 meses distintos)
-    if 'Spotted_dt' in df.columns:
-        df_temp = df.dropna(subset=['Spotted_dt']).copy()
-        if not df_temp.empty:
-            df_temp['Mes'] = df_temp['Spotted_dt'].dt.to_period('M')
-            reincid = df_temp.groupby('Defect')['Mes'].nunique()
-            reincid = reincid[reincid >= 3].sort_values(ascending=False).head(5)
-            if not reincid.empty:
-                linhas_r = [
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;• <b>{defect}</b>: aparece em <b>{n_meses}</b> meses distintos"
-                    for defect, n_meses in reincid.items()
-                ]
-                causas.append(
-                    "<b>Reincidência Temporal:</b> Defeitos que se repetem ao longo "
-                    "de vários meses indicam que a causa raiz não foi tratada — "
-                    "apenas o sintoma está sendo corrigido pontualmente:<br/>"
-                    + "<br/>".join(linhas_r)
-                )
+    # 9d. Reincidência temporal
+    df_temp = df.dropna(subset=['Spotted_dt']).copy()
+    if not df_temp.empty:
+        df_temp['Mes'] = df_temp['Spotted_dt'].dt.to_period('M')
+        reincid = df_temp.groupby('Defect')['Mes'].nunique()
+        reincid = reincid[reincid >= 3].sort_values(ascending=False).head(5)
+        if not reincid.empty:
+            linhas_r = [
+                f"&nbsp;&nbsp;&nbsp;&nbsp;• <b>{defect}</b>: aparece em <b>{n_meses}</b> meses distintos"
+                for defect, n_meses in reincid.items()
+            ]
+            causas.append(
+                "<b>Reincidência Temporal:</b> Defeitos que se repetem ao longo "
+                "de vários meses indicam que a causa raiz não foi tratada:<br/>"
+                + "<br/>".join(linhas_r)
+            )
 
     if causas:
         analise['causa_raiz'] = "<br/><br/>".join(causas)
@@ -678,163 +688,85 @@ def gerar_analise(df, nome_projeto):
             "Não foram identificados padrões de concentração significativa nos dados. "
             "Base de dados atual insuficiente para análise heurística de causa raiz."
         )
-    
-    # Seção de conclusão de causa raiz removida conforme solicitado
+
     analise['causa_raiz_conclusao'] = ""
 
-    # ─── Integração LLM (Substituição dos Textos) ───
+    # ─── Integração LLM ──────────────────────────────────────────────────────
     if CLIENT_OPENAI:
         try:
             print(f"  [{nome_projeto}] Consultando IA...")
-            # Preparar contexto
             kpi_context = {
-                "projeto": nome_projeto,
+                "projeto":            nome_projeto,
                 "total_apontamentos": int(total),
-                "resolvidos": int(resolvidos),
-                "pendentes": int(sem_corr),
-                "taxa_resolucao": round(pct_res, 1),
-                "seguranca": int(n_seg),
-                "qualidade": int(n_qual),
+                "resolvidos":         int(resolvidos),
+                "pendentes":          int(sem_corr),
+                "taxa_resolucao":     round(pct_res, 1),
+                "seguranca":          int(n_seg),
+                "qualidade":          int(n_qual),
             }
-            
+
             # Categorias principais
             cats_context = []
-            # cats_sig é calculado anteriormente na função
-            if 'cats_sig' in locals() and not cats_sig.empty:
+            if not cats_sig.empty:
                 top_c = cats_sig.sort_values('total', ascending=False).head(10)
                 for c, row in top_c.iterrows():
                     cats_context.append({
                         "categoria": str(c),
-                        "total": int(row['total']),
+                        "total":     int(row['total']),
                         "resolvidos": int(row['resolvidos']),
-                        "pct": round(row['pct'], 1)
+                        "pct":       round(row['pct'], 1)
                     })
             kpi_context['categorias_top'] = cats_context
-            
-            # Tendência (se disponível)
-            if 'por_mes' in locals() and len(por_mes) >= 2:
+
+            # FIX: usar variáveis do escopo da função, não locals()
+            if por_mes_result is not None and len(por_mes_result) >= 2:
                 kpi_context['tendencia_mensal'] = {
-                    "ultimo_mes": int(por_mes.iloc[-1]),
-                    "mes_anterior": int(por_mes.iloc[-2]),
-                    "media_mensal": round(por_mes.mean(), 1)
+                    "ultimo_mes":   int(por_mes_result.iloc[-1]),
+                    "mes_anterior": int(por_mes_result.iloc[-2]),
+                    "media_mensal": round(float(por_mes_result.mean()), 1)
                 }
-                
-            # SLA (se disponível)
-            if 'mttr_global' in locals():
-                kpi_context['sla_mttr_dias'] = round(mttr_global, 1)
-                
-            # Causas Raiz (Resumo das encontradas nativamente)
+
+            if mttr_global_result is not None:
+                kpi_context['sla_mttr_dias'] = round(float(mttr_global_result), 1)
+
             if causas:
                 kpi_context['padroes_causa_raiz'] = causas
 
-            # Consultar LLM
             analise_llm = consultar_llm(kpi_context)
-            
+
             if analise_llm:
-                # Atualizar chaves se existirem no retorno
                 for k, v in analise_llm.items():
                     if v:
                         if k == 'causa_raiz_insights' and 'causa_raiz' in analise:
-                            # Concatenar insights da IA após os dados nativos
                             analise['causa_raiz'] += f"<br/><br/><b>Análise e Recomendações:</b><br/>{v}"
-                        elif k != 'causa_raiz_insights': # Evitar criar chave duplicada ou errada
+                        elif k != 'causa_raiz_insights':
                             analise[k] = v
 
         except Exception as e:
             print(f"Erro ao processar LLM: {e}")
 
     return analise, {
-        'total': total, 'resolvidos': resolvidos, 'sem_corr': sem_corr,
-        'pct_res': pct_res, 'n_seg': n_seg, 'n_qual': n_qual
+        'total':      total,
+        'resolvidos': resolvidos,
+        'sem_corr':   sem_corr,
+        'pct_res':    pct_res,
+        'n_seg':      n_seg,
+        'n_qual':     n_qual
     }
 
-# ─── Anexar PDF ────────────────────────────────────────────────────────────
-def encontrar_ultimo_relatorio_snagr(nome_proj):
-    """Encontra o PDF mais recente na pasta relatorios_SnagR para um projeto."""
-    pasta_proj = os.path.join("relatorios_SnagR", nome_proj)
-    if not os.path.exists(pasta_proj):
-        return None
-    
-    pastas_data = sorted(glob.glob(os.path.join(pasta_proj, "20*")), reverse=True)
-    if not pastas_data:
-        return None
-    
-    arquivo_pdf = os.path.join(pastas_data[0], f"{nome_proj}_Relatorio.pdf")
-    return arquivo_pdf if os.path.exists(arquivo_pdf) else None
 
-# ─── Gerar Conclusão Final ─────────────────────────────────────────────────
-def gerar_conclusao(analise, kpis, nome_projeto):
-    # Se o LLM gerou uma conclusão final robusta, use-a.
-    if analise.get('conclusao_final'):
-        return analise['conclusao_final']
-
-    total = kpis['total']
-    pct = kpis['pct_res']
-    pend = kpis['sem_corr']
-
-    # Tom geral
-    if pct >= 80:
-        abertura = (
-            f"O projeto <b>{nome_projeto}</b> apresenta um cenário positivo de gestão da qualidade. "
-            f"Com <b>{pct:.0f}%</b> dos apontamentos resolvidos, a equipe demonstra comprometimento "
-            "e capacidade de resposta às demandas identificadas em campo."
-        )
-        perspectiva = (
-            "A perspectiva é favorável para a continuidade da operação. "
-            "Recomenda-se manter o ritmo de tratativas e focar na resolução dos itens "
-            "crônicos remanescentes para atingir a excelência operacional."
-        )
-    elif pct >= 50:
-        abertura = (
-            f"O projeto <b>{nome_projeto}</b> encontra-se em um estágio intermediário de gestão. "
-            f"A taxa de resolução de <b>{pct:.0f}%</b> indica que há esforço de tratativa, "
-            f"porém o volume de <b>{pend} itens pendentes</b> exige atenção redobrada."
-        )
-        perspectiva = (
-            "É importante intensificar os planos de ação nas categorias mais críticas "
-            "e estabelecer metas semanais de resolução. A aplicação de causa raiz "
-            "nos defeitos reincidentes pode reduzir significativamente o passivo."
-        )
-    else:
-        abertura = (
-            f"O projeto <b>{nome_projeto}</b> apresenta um cenário que demanda ação imediata. "
-            f"Com apenas <b>{pct:.0f}%</b> de resolução e <b>{pend} apontamentos pendentes</b>, "
-            "o acúmulo de não-conformidades representa risco à qualidade final da entrega "
-            "e à segurança do canteiro."
-        )
-        perspectiva = (
-            "Recomenda-se fortemente a elaboração de um planto de ação "
-            "para correção dos itens críticos, definição de responsáveis e "
-            "prazos realistas. O acompanhamento mais focado é indispensável nesta fase, para correção dos itens apontados e principalmente e evitar a reincidência em outros pavimentos."
-        )
-
-    conclusao = (
-        f"{abertura}"
-        f"<br/><br/>Ao longo deste relatório, foram analisados <b>{total} apontamentos</b> "
-        "sob as perspectivas de segmentação (Qualidade vs Segurança), desempenho por categoria "
-        "e subcategoria, tendência temporal, SLA de resposta e padrões de causa raiz. "
-        "Os dados permitem uma visão objetiva do estado atual e orientam as próximas decisões."
-        f"<br/><br/>{perspectiva}"
-        "<br/><br/><i>Este relatório foi gerado automaticamente a partir dos dados registrados "
-        "na plataforma SnagR, utilizando análise estatística nativa. As conclusões "
-        "e recomendações são baseadas exclusivamente nos padrões identificados nos dados.</i>"
-    )
-    return conclusao
-
-# ─── Seção 4 — Mini Gráficos de Barras por Subcategoria ────────────────────
+# ─── Seção 4 — Mini Gráficos de Barras por Subcategoria ─────────────────────
 def montar_secao_categorias(df, largura):
-    """Gera flowables com mini gráficos de barras horizontais por subcategoria."""
     from reportlab.graphics.shapes import Drawing, Rect, String as GStr
 
     flowables = []
 
-    LABEL_W = 62 * mm      # coluna do rótulo
-    VAL_W   = 22 * mm      # coluna do valor
-    BAR_W   = largura - LABEL_W - VAL_W  # coluna da barra
-    ROW_H   = 7  * mm      # altura de cada linha de subcategoria
-    BAR_H   = 4  * mm      # espessura da barra
+    LABEL_W = 62 * mm
+    VAL_W   = 22 * mm
+    BAR_W   = largura - LABEL_W - VAL_W
+    ROW_H   = 7  * mm
+    BAR_H   = 4  * mm
 
-    # ── Legenda ──────────────────────────────────────────────────────────────
     leg = Drawing(largura, 8 * mm)
     leg.add(Rect(0,       1*mm, 8*mm, 4*mm, fillColor=COR_VERDE,                  strokeColor=None))
     leg.add(GStr(10*mm,   2*mm, "Resolvidos",  fontSize=7, fillColor=colors.HexColor("#555555")))
@@ -863,7 +795,6 @@ def montar_secao_categorias(df, largura):
             cor_badge = COR_VERM
             avaliacao = "Crítico"
 
-        # ── Cabeçalho da Categoria ────────────────────────────────────────────
         st_h = ParagraphStyle("ch", fontName="Helvetica-Bold", fontSize=9, textColor=BRANCO)
         st_p = ParagraphStyle("cp", fontName="Helvetica",      fontSize=8, textColor=BRANCO)
 
@@ -883,54 +814,47 @@ def montar_secao_categorias(df, largura):
             ("ALIGN",         (1, 0), (1,  0),  "RIGHT"),
         ]))
 
-        # ── Barras por Subcategoria ───────────────────────────────────────────
         sub_counts = df_cat["Defect"].value_counts()
         if sub_counts.empty:
             flowables.append(KeepTogether([hdr, Spacer(1, 3 * mm)]))
             continue
 
-        max_val  = float(sub_counts.max())
-        n_subs   = len(sub_counts)
-        total_h  = n_subs * ROW_H + 3 * mm
+        max_val = float(sub_counts.max())
+        n_subs  = len(sub_counts)
+        total_h = n_subs * ROW_H + 3 * mm
 
         d = Drawing(largura, total_h)
 
         for i, (defect, n_def) in enumerate(sub_counts.items()):
-            y_base  = total_h - (i + 1) * ROW_H + 1 * mm
-            bar_y   = y_base + 1 * mm
-            prop    = n_def / max_val
-            fill_w  = BAR_W * prop
+            y_base = total_h - (i + 1) * ROW_H + 1 * mm
+            bar_y  = y_base + 1 * mm
+            prop   = n_def / max_val
+            fill_w = BAR_W * prop
 
             df_def  = df_cat[df_cat["Defect"] == defect]
             res_def = int(df_def["StatusAg"].isin(["Corrigido", "Verificado"]).sum())
             pct_d   = res_def / n_def if n_def else 0
 
-            # Track (fundo cinza)
             d.add(Rect(LABEL_W, bar_y, BAR_W, BAR_H,
                        fillColor=COR_CINZA_L, strokeColor=COR_CINZA_M, strokeWidth=0.3))
 
-            # Parte pendente (salmão)
             if fill_w > 0:
                 d.add(Rect(LABEL_W, bar_y, fill_w, BAR_H,
                            fillColor=colors.HexColor("#ffccbc"), strokeColor=None))
 
-            # Parte resolvida (verde)
             res_w = fill_w * pct_d
             if res_w > 0:
                 d.add(Rect(LABEL_W, bar_y, res_w, BAR_H,
                            fillColor=COR_VERDE, strokeColor=None))
 
-            # Rótulo (truncado em 42 chars)
             lbl = str(defect)[:42] if defect else "—"
             d.add(GStr(2 * mm, y_base + 1.5 * mm, lbl,
                        fontSize=7, fillColor=colors.HexColor("#333333")))
 
-            # Valor numérico
             d.add(GStr(LABEL_W + BAR_W + 2 * mm, y_base + 1.5 * mm,
                        f"{n_def}  ({pct_d * 100:.0f}%)",
                        fontSize=7, fillColor=colors.HexColor("#444444")))
 
-        # Manter cabeçalho + gráfico juntos na mesma página
         flowables.append(KeepTogether([hdr, d, Spacer(1, 4 * mm)]))
 
     return flowables
@@ -938,7 +862,6 @@ def montar_secao_categorias(df, largura):
 
 def montar_grafico_tendencia(df, largura):
     from reportlab.graphics.shapes import Drawing, Rect, String as GStr, Line as GLine, PolyLine, Circle
-    from reportlab.platypus import Table, Spacer
     import math
 
     df2 = df.copy()
@@ -957,12 +880,14 @@ def montar_grafico_tendencia(df, largura):
         if 'FixStatus_Ref' in df2.columns:
             df2['StatusAg'] = df2['FixStatus_Ref'].apply(agrupar_status)
         else:
-            df2['StatusAg'] = df2.apply(lambda r: agrupar_status(r.get('FixStatus') or r.get('Status', 'Open')), axis=1)
+            df2['StatusAg'] = df2.apply(
+                lambda r: agrupar_status(r.get('FixStatus') or r.get('Status', 'Open')), axis=1)
 
     df_res = df2[df2['StatusAg'].isin(['Corrigido', 'Verificado'])].copy()
     df_res['LastChanged_dt2'] = df_res['LastChanged'].apply(parse_data)
     df_res = df_res.dropna(subset=['LastChanged_dt2'])
-    resolvidos = df_res.set_index('LastChanged_dt2').resample('ME').size() if not df_res.empty else pd.Series(dtype=int)
+    resolvidos = (df_res.set_index('LastChanged_dt2').resample('ME').size()
+                  if not df_res.empty else pd.Series(dtype=int))
 
     idx = abertos.index.union(resolvidos.index).sort_values()
     if len(idx) < 2:
@@ -970,7 +895,7 @@ def montar_grafico_tendencia(df, largura):
 
     idx = idx[-12:]
 
-    abertos_v = [int(abertos.get(m, 0)) for m in idx]
+    abertos_v   = [int(abertos.get(m, 0))   for m in idx]
     resolvidos_v = [int(resolvidos.get(m, 0)) for m in idx]
 
     backlog_v = []
@@ -982,12 +907,12 @@ def montar_grafico_tendencia(df, largura):
     max_y = max(abertos_v + resolvidos_v + backlog_v + [1])
     max_y = int(math.ceil(max_y / 10.0) * 10) if max_y >= 10 else max_y
 
-    w = float(largura)
-    h = 55 * mm
-    m_left = 18 * mm
-    m_right = 4 * mm
+    w        = float(largura)
+    h        = 55 * mm
+    m_left   = 18 * mm
+    m_right  = 4  * mm
     m_bottom = 10 * mm
-    m_top = 10 * mm
+    m_top    = 10 * mm
 
     x0 = m_left
     y0 = m_bottom
@@ -1005,7 +930,7 @@ def montar_grafico_tendencia(df, largura):
         d.add(GLine(x0, y, x1, y, strokeColor=COR_CINZA_L, strokeWidth=0.5))
         d.add(GStr(2, y - 2, str(v), fontSize=7, fillColor=COR_CINZA_M))
 
-    n = len(idx)
+    n     = len(idx)
     denom = (n - 1) if n > 1 else 1
 
     def xy(i, v):
@@ -1013,9 +938,9 @@ def montar_grafico_tendencia(df, largura):
         y = y0 + (y1 - y0) * (v / max_y) if max_y else y0
         return x, y
 
-    cor_abertos = COR_PRIM
-    cor_res = COR_VERDE
-    cor_backlog = colors.HexColor("#ef6c00")
+    cor_abertos  = COR_PRIM
+    cor_res      = COR_VERDE
+    cor_backlog  = colors.HexColor("#ef6c00")
 
     def add_series(vals, cor):
         pts = []
@@ -1027,20 +952,20 @@ def montar_grafico_tendencia(df, largura):
             x, y = xy(i, v)
             d.add(Circle(x, y, 1.4, fillColor=cor, strokeColor=cor))
 
-    add_series(abertos_v, cor_abertos)
+    add_series(abertos_v,   cor_abertos)
     add_series(resolvidos_v, cor_res)
-    add_series(backlog_v, cor_backlog)
+    add_series(backlog_v,   cor_backlog)
 
-    leg_y = h - 6 * mm
-    leg_x = x0
+    leg_y  = h - 6 * mm
+    leg_x  = x0
     leg_items = [
         (cor_abertos, "Abertos"),
-        (cor_res, "Resolvidos"),
+        (cor_res,     "Resolvidos"),
         (cor_backlog, "Backlog"),
     ]
     for cor, lbl in leg_items:
-        d.add(GLine(leg_x, leg_y, leg_x + 10 * mm, leg_y, strokeColor=cor, strokeWidth=2.0))
-        d.add(GStr(leg_x + 12 * mm, leg_y - 2, lbl, fontSize=8, fillColor=colors.HexColor("#444444")))
+        d.add(GLine(leg_x, leg_y, leg_x + 10*mm, leg_y, strokeColor=cor, strokeWidth=2.0))
+        d.add(GStr(leg_x + 12*mm, leg_y - 2, lbl, fontSize=8, fillColor=colors.HexColor("#444444")))
         leg_x += 32 * mm
 
     step = max(1, int(math.ceil(n / 6.0)))
@@ -1050,7 +975,7 @@ def montar_grafico_tendencia(df, largura):
         x, _ = xy(i, 0)
         d.add(GStr(x - 8, 2, m.strftime('%m/%y'), fontSize=7, fillColor=colors.HexColor("#666666")))
 
-    linhas = min(6, n)
+    linhas  = min(6, n)
     idx_tbl = idx[-linhas:]
     data_tbl = [["Mês", "Abertos", "Resolvidos", "Backlog"]]
     start = n - linhas
@@ -1058,99 +983,86 @@ def montar_grafico_tendencia(df, largura):
         i = start + j
         data_tbl.append([m.strftime('%m/%Y'), str(abertos_v[i]), str(resolvidos_v[i]), str(backlog_v[i])])
 
-    t = Table(data_tbl, colWidths=[largura * 0.22, largura * 0.18, largura * 0.20, largura * 0.20])
+    t = Table(data_tbl, colWidths=[largura*0.22, largura*0.18, largura*0.20, largura*0.20])
     t.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), COR_PRIM),
-        ('TEXTCOLOR', (0, 0), (-1, 0), BRANCO),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 8),
-        ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
-        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-        ('GRID', (0, 0), (-1, -1), 0.4, COR_CINZA_M),
+        ('TEXTCOLOR',  (0, 0), (-1, 0), BRANCO),
+        ('FONTNAME',   (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE',   (0, 0), (-1, 0), 8),
+        ('ALIGN',      (1, 0), (-1, -1), 'CENTER'),
+        ('ALIGN',      (0, 0), (0, -1), 'LEFT'),
+        ('GRID',       (0, 0), (-1, -1), 0.4, COR_CINZA_M),
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [BRANCO, COR_CINZA_L]),
-        ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ('FONTSIZE',   (0, 1), (-1, -1), 8),
         ('TOPPADDING', (0, 0), (-1, -1), 3),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
     ]))
 
-    return [Spacer(1, 2 * mm), d, Spacer(1, 2 * mm), t, Spacer(1, 2 * mm)]
+    return [Spacer(1, 2*mm), d, Spacer(1, 2*mm), t, Spacer(1, 2*mm)]
 
 
-# ─── Montar PDF ────────────────────────────────────────────────────────────
+# ─── Callbacks de Página ──────────────────────────────────────────────────────
 def _on_cover(nome_projeto, data_impressao):
-    """Callback para a página de capa — usa imagem modelo como fundo."""
+    """Callback para a página de capa."""
     def fn(canvas, doc):
         w, h = A4
         canvas.saveState()
 
-        # ── Caminho da imagem modelo de capa ──
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        img_capa = os.path.join(script_dir, "Imagem Modelo",
-                                "modelo capa_relatório análitico.png")
+        img_capa   = os.path.join(script_dir, "Imagem Modelo",
+                                  "modelo capa_relatório análitico.png")
 
         if os.path.exists(img_capa):
-            # Imagem modelo cobre toda a página A4
-            # Otimização: compressão JPEG para reduzir tamanho do PDF
-            if Image is not None and BytesIO is not None:
+            if PILLOW_DISPONIVEL and BytesIO is not None:
                 try:
-                    # Abrir imagem com Pillow
                     pil_img = Image.open(img_capa)
-                    # Converter para RGB (caso PNG com canal alpha)
                     if pil_img.mode in ('RGBA', 'LA', 'P'):
                         background = Image.new('RGB', pil_img.size, (255, 255, 255))
-                        background.paste(pil_img, mask=pil_img.split()[-1] if pil_img.mode == 'RGBA' else None)
+                        background.paste(
+                            pil_img,
+                            mask=pil_img.split()[-1] if pil_img.mode == 'RGBA' else None
+                        )
                         pil_img = background
-                    # Comprimir para JPEG em buffer de memória
                     buffer = BytesIO()
                     pil_img.save(buffer, format='JPEG', quality=85, optimize=True)
                     buffer.seek(0)
-                    # Usar ImageReader do ReportLab (já importado como RLImage)
-                    canvas.drawImage(RLImage(buffer), 0, 0, width=w, height=h,
+                    # FIX: usar ImageReader (não RLImage/Flowable) com canvas.drawImage
+                    canvas.drawImage(ImageReader(buffer), 0, 0, width=w, height=h,
                                      preserveAspectRatio=False, mask='auto')
                 except Exception as e:
-                    # Fallback para imagem original em caso de erro
                     print(f"  [AVISO] Falha na compressão da capa: {e}")
                     canvas.drawImage(img_capa, 0, 0, width=w, height=h,
                                      preserveAspectRatio=False, mask='auto')
             else:
-                # Se Pillow não disponível, usar imagem original
                 canvas.drawImage(img_capa, 0, 0, width=w, height=h,
                                  preserveAspectRatio=False, mask='auto')
         else:
-            # Fallback: fundo azul caso a imagem não seja encontrada
             canvas.setFillColor(COR_PRIM)
             canvas.rect(0, 0, w, h, fill=1, stroke=0)
             canvas.setFillColor(COR_VERDE)
             canvas.rect(0, h * 0.48, w, 3*mm, fill=1, stroke=0)
 
-        # ── Nome do Projeto — sobreposto sobre a imagem ──
-        # Título Principal
         titulo_capa = f"Relatório Analítico de Apontamentos do {nome_projeto}"
-        
-        # Sombra sutil para legibilidade
         canvas.setFillColor(colors.HexColor("#00000055"))
         canvas.setFont("Helvetica-Bold", 20)
         canvas.drawCentredString(w/2 + 1, h * 0.55 - 1, titulo_capa)
-        # Texto branco principal
         canvas.setFillColor(BRANCO)
         canvas.drawCentredString(w/2, h * 0.55, titulo_capa)
 
-        # ── Data de Geração ──
         canvas.setFont("Helvetica", 14)
         canvas.setFillColor(colors.HexColor("#00000055"))
         canvas.drawCentredString(w/2 + 1, h * 0.50 - 1, f"Gerado em: {data_impressao}")
         canvas.setFillColor(BRANCO)
         canvas.drawCentredString(w/2, h * 0.50, f"Gerado em: {data_impressao}")
 
-        # ── Rodapé Direito da Capa ──
         canvas.setFont("Helvetica", 7)
         canvas.drawRightString(w - 15*mm, 10*mm, "Desenvolvimento: Felipe de P. Luz")
-
         canvas.restoreState()
     return fn
 
+
 def _on_page(nome_projeto, data_impressao):
-    """Callback para páginas internas — com cabeçalho e rodapé."""
+    """Callback para páginas internas."""
     def fn(canvas, doc):
         w, h = A4
         canvas.saveState()
@@ -1166,7 +1078,6 @@ def _on_page(nome_projeto, data_impressao):
         canvas.setStrokeColor(COR_VERDE)
         canvas.setLineWidth(1.5)
         canvas.line(0, h - 18*mm, w, h - 18*mm)
-        # Rodapé
         canvas.setStrokeColor(COR_CINZA_M)
         canvas.setLineWidth(0.5)
         canvas.line(15*mm, 10*mm, w - 15*mm, 10*mm)
@@ -1176,62 +1087,98 @@ def _on_page(nome_projeto, data_impressao):
         canvas.restoreState()
     return fn
 
-# ─── Otimização de PDF ──────────────────────────────────────────────────────
-def otimizar_pdf_final(caminho_entrada):
-    """
-    Tenta otimizar o PDF gerado reescrevendo-o com PyPDF2 (se disponível).
-    A compressão de conteúdo (zlib) já é feita pelo ReportLab com pageCompression=1,
-    mas o PyPDF2 pode ajudar a limpar metadados ou reestruturar o arquivo.
-    """
-    try:
-        if 'PdfReader' not in globals() or 'PdfWriter' not in globals():
-            return
 
-        # Verificar tamanho original
+# ─── Otimização de PDF ────────────────────────────────────────────────────────
+def otimizar_pdf_final(caminho_entrada):
+    if not PYPDF2_DISPONIVEL:
+        return
+    try:
         tamanho_orig = os.path.getsize(caminho_entrada)
-        
         reader = PdfReader(caminho_entrada)
         writer = PdfWriter()
-
-        # Copiar páginas (compressão de streams é padrão no PyPDF2 moderno)
         for page in reader.pages:
             writer.add_page(page)
-        
-        # Copiar metadados
         if reader.metadata:
             writer.add_metadata(reader.metadata)
-        
-        # Salvar em arquivo temporário
         caminho_temp = caminho_entrada.replace(".pdf", "_temp.pdf")
         with open(caminho_temp, "wb") as f:
             writer.write(f)
-        
         tamanho_novo = os.path.getsize(caminho_temp)
-        
-        # Só substituir se houve redução ou se a diferença for desprezível (limpeza)
-        # Se aumentou muito (as vezes acontece), descarta.
         if tamanho_novo < tamanho_orig:
             os.replace(caminho_temp, caminho_entrada)
-            reducao = (1 - tamanho_novo/tamanho_orig) * 100
-            print(f"  [INFO] Otimização PyPDF2: {tamanho_orig/1024:.1f}KB -> {tamanho_novo/1024:.1f}KB (-{reducao:.1f}%)")
+            reducao = (1 - tamanho_novo / tamanho_orig) * 100
+            print(f"  [INFO] Otimização: {tamanho_orig/1024:.1f}KB -> {tamanho_novo/1024:.1f}KB (-{reducao:.1f}%)")
         else:
             os.remove(caminho_temp)
-            # print(f"  [INFO] Otimização PyPDF2 não reduziu tamanho ({tamanho_novo/1024:.1f}KB). Mantendo original.")
-            
     except Exception as e:
-        print(f"  [AVISO] Falha na otimização pós-processamento: {e}")
-        if os.path.exists(caminho_entrada.replace(".pdf", "_temp.pdf")):
+        print(f"  [AVISO] Falha na otimização: {e}")
+        temp = caminho_entrada.replace(".pdf", "_temp.pdf")
+        if os.path.exists(temp):
             try:
-                os.remove(caminho_entrada.replace(".pdf", "_temp.pdf"))
-            except:
+                os.remove(temp)
+            except Exception:
                 pass
 
+
+# ─── Gerar Conclusão Final ────────────────────────────────────────────────────
+def gerar_conclusao(analise, kpis, nome_projeto):
+    if analise.get('conclusao_final'):
+        return analise['conclusao_final']
+
+    total = kpis['total']
+    pct   = kpis['pct_res']
+    pend  = kpis['sem_corr']
+
+    if pct >= 80:
+        abertura = (
+            f"O projeto <b>{nome_projeto}</b> apresenta um cenário positivo de gestão da qualidade. "
+            f"Com <b>{pct:.0f}%</b> dos apontamentos resolvidos, a equipe demonstra comprometimento "
+            "e capacidade de resposta às demandas identificadas em campo."
+        )
+        perspectiva = (
+            "A perspectiva é favorável para a continuidade da operação. "
+            "Recomenda-se manter o ritmo de tratativas e focar na resolução dos itens "
+            "crônicos remanescentes para atingir a excelência operacional."
+        )
+    elif pct >= 50:
+        abertura = (
+            f"O projeto <b>{nome_projeto}</b> encontra-se em um estágio intermediário de gestão. "
+            f"A taxa de resolução de <b>{pct:.0f}%</b> indica que há esforço de tratativa, "
+            f"porém o volume de <b>{pend} itens pendentes</b> exige atenção redobrada."
+        )
+        perspectiva = (
+            "É importante intensificar os planos de ação nas categorias mais críticas "
+            "e estabelecer metas semanais de resolução."
+        )
+    else:
+        abertura = (
+            f"O projeto <b>{nome_projeto}</b> apresenta um cenário que demanda ação imediata. "
+            f"Com apenas <b>{pct:.0f}%</b> de resolução e <b>{pend} apontamentos pendentes</b>, "
+            "o acúmulo de não-conformidades representa risco à qualidade final da entrega "
+            "e à segurança do canteiro."
+        )
+        perspectiva = (
+            "Recomenda-se fortemente a elaboração de um plano de ação para correção dos "
+            "itens críticos, definição de responsáveis e prazos realistas."
+        )
+
+    return (
+        f"{abertura}"
+        f"<br/><br/>Ao longo deste relatório, foram analisados <b>{total} apontamentos</b> "
+        "sob as perspectivas de segmentação (Qualidade vs Segurança), desempenho por categoria "
+        "e subcategoria, tendência temporal, SLA de resposta e padrões de causa raiz."
+        f"<br/><br/>{perspectiva}"
+        "<br/><br/><i>Este relatório foi gerado automaticamente a partir dos dados registrados "
+        "na plataforma SnagR, utilizando análise estatística nativa e inteligência artificial.</i>"
+    )
+
+
+# ─── Gerar Relatório Analítico (PDF + DOCX) ───────────────────────────────────
 def gerar_relatorio_analitico(arquivo_jsonl, pasta_base, data_str, data_impressao):
     nome_proj = os.path.splitext(os.path.basename(arquivo_jsonl))[0]
     pasta_out = os.path.join(pasta_base, nome_proj, data_str)
     os.makedirs(pasta_out, exist_ok=True)
 
-    # Carregar dados
     dados = []
     with open(arquivo_jsonl, 'r', encoding='utf-8') as f:
         for l in f:
@@ -1240,7 +1187,8 @@ def gerar_relatorio_analitico(arquivo_jsonl, pasta_base, data_str, data_impressa
                     item = json.loads(l)
                     item['FixStatus_Ref'] = item.get('FixStatus') or item.get('Status', 'Open')
                     dados.append(item)
-                except: pass
+                except Exception:
+                    pass
 
     if not dados:
         print(f"  [{nome_proj}] Sem dados. Pulando.")
@@ -1251,30 +1199,25 @@ def gerar_relatorio_analitico(arquivo_jsonl, pasta_base, data_str, data_impressa
     st = estilos()
 
     caminho_pdf = os.path.join(pasta_out, f"{nome_proj}_Relatorio_Analitico.pdf")
-    # Otimização: pageCompression=1 ativa compressão zlib dos fluxos de conteúdo
     doc = SimpleDocTemplate(caminho_pdf, pagesize=A4,
                               leftMargin=15*mm, rightMargin=15*mm,
                               topMargin=23*mm, bottomMargin=15*mm,
                               pageCompression=1)
 
-    story = []
+    story  = []
     largura = A4[0] - 30*mm
 
-    # ── Página de Capa (conteúdo vazio — desenhada via canvas callback) ──
-    story.append(Spacer(1, 1))  # placeholder para a capa
+    # ── Capa ──
+    story.append(Spacer(1, 1))
     story.append(PageBreak())
 
     # ── Índice ──
-    st_indice_titulo = ParagraphStyle('idx_titulo', fontName='Helvetica-Bold', fontSize=11,
-                                       textColor=COR_PRIM, leading=18, spaceBefore=2*mm)
     st_indice_item = ParagraphStyle('idx_item', fontName='Helvetica', fontSize=10,
                                      textColor=colors.HexColor('#333333'), leading=16,
                                      leftIndent=10*mm)
-
     story.append(Paragraph("Índice", st['titulo']))
     story.append(HRFlowable(width="100%", thickness=1, color=COR_VERDE, spaceAfter=4*mm))
-
-    indice_items = [
+    for item in [
         "1. Objetivo",
         "2. Resumo Executivo",
         "3. Segmentação: Segurança vs Qualidade",
@@ -1283,13 +1226,11 @@ def gerar_relatorio_analitico(arquivo_jsonl, pasta_base, data_str, data_impressa
         "6. SLA / Tempo de Resposta (MTTR)",
         "7. Análise de Causa Raiz",
         "8. Conclusão",
-        "9. Anexo — Relatório SnagR",
-    ]
-    for item in indice_items:
+    ]:
         story.append(Paragraph(item, st_indice_item))
     story.append(PageBreak())
 
-    # ── Objetivo ──
+    # ── Seção 1 — Objetivo ──
     story.append(Paragraph("1. Objetivo", st['subtitulo']))
     story.append(Paragraph(
         f"Este relatório tem como objetivo apresentar uma análise detalhada dos "
@@ -1297,122 +1238,70 @@ def gerar_relatorio_analitico(arquivo_jsonl, pasta_base, data_str, data_impressa
         f"identificados através da plataforma SnagR."
         f"<br/><br/>"
         f"O documento abrange o diagnóstico do cenário atual, a avaliação de desempenho "
-        f"por categoria, subcategoria e empreiteira, a análise de tendência temporal, "
-        f"o tempo médio de resposta (SLA) e a identificação de padrões de causa raiz."
-        f"<br/><br/>"
-        f"As informações aqui consolidadas visam apoiar a tomada de decisão da gestão, "
-        f"direcionando ações corretivas e preventivas para a melhoria contínua dos "
-        f"processos construtivos e da segurança do trabalho.",
+        f"por categoria, subcategoria e empresa responsável, a análise de tendência temporal, "
+        f"o tempo médio de resposta (SLA) e a identificação de padrões de causa raiz.",
         st['corpo']
     ))
 
-    st_termos_titulo = ParagraphStyle(
-        'termos_titulo',
-        fontName='Helvetica-Bold',
-        fontSize=11,
-        textColor=COR_PRIM,
-        spaceBefore=4*mm,
-        spaceAfter=2*mm
-    )
-
+    st_termos_titulo = ParagraphStyle('termos_titulo', fontName='Helvetica-Bold', fontSize=11,
+                                       textColor=COR_PRIM, spaceBefore=4*mm, spaceAfter=2*mm)
     termos_defs = (
         "<b>Apontamento:</b> registro de uma não conformidade, risco ou oportunidade de melhoria identificado em campo.<br/>"
-        "<b>KPI (Indicador-chave):</b> métrica objetiva usada para acompanhar desempenho (ex.: total de itens, pendências, taxa de resolução).<br/>"
-        "<b>Backlog:</b> volume acumulado de apontamentos ainda não encerrados (pendentes).<br/>"
-        "<b>Pendente:</b> apontamento sem tratativa final (ex.: “Sem Correção”).<br/>"
-        "<b>Resolvido:</b> apontamento tratado e encerrado no fluxo (ex.: “Corrigido” e/ou “Verificado”).<br/>"
-        "<b>Taxa de resolução:</b> percentual de apontamentos resolvidos em relação ao total no período analisado.<br/>"
-        "<b>SLA (Tempo de resposta):</b> tempo observado entre a abertura e o encerramento/validação do apontamento, usado para medir agilidade de tratativa.<br/>"
-        "<b>MTTR:</b> tempo médio para resolução; indicador de eficiência na correção (quanto menor, melhor).<br/>"
-        "<b>Categoria / Subcategoria:</b> classificação do tema do apontamento (Categoria) e o tipo específico recorrente (Subcategoria/Defect).<br/>"
-        "<b>Segmentação (Qualidade vs Segurança):</b> agrupamento dos apontamentos por natureza do impacto (integridade do produto vs risco de SST).<br/>"
-        "<b>Causa raiz:</b> motivo estrutural que explica a recorrência do problema; base para ações preventivas e redução de reincidência."
+        "<b>KPI:</b> métrica objetiva usada para acompanhar desempenho.<br/>"
+        "<b>Backlog:</b> volume acumulado de apontamentos ainda não encerrados.<br/>"
+        "<b>Pendente:</b> apontamento sem tratativa final.<br/>"
+        "<b>Resolvido:</b> apontamento tratado e encerrado no fluxo.<br/>"
+        "<b>Taxa de resolução:</b> percentual de apontamentos resolvidos em relação ao total.<br/>"
+        "<b>SLA:</b> tempo observado entre a abertura e o encerramento do apontamento.<br/>"
+        "<b>MTTR:</b> tempo médio para resolução; quanto menor, melhor.<br/>"
+        "<b>Causa raiz:</b> motivo estrutural que explica a recorrência do problema."
     )
-
     story.append(KeepTogether([
         Paragraph("1.1 Termos e Definições", st_termos_titulo),
         Paragraph(termos_defs, st['corpo']),
     ]))
     story.append(Spacer(1, 4*mm))
 
-    # ── KPIs em Cards ──
-    def kpi_cell(valor, label, cor=COR_PRIM):
-        return [
-            Paragraph(str(valor), ParagraphStyle('kv', fontName='Helvetica-Bold', fontSize=22, textColor=cor, alignment=TA_CENTER)),
-            Paragraph(label, st['kpi_label']),
-        ]
-
+    # ── KPIs ──
+    quarter = largura / 4
     kpi_data = [
-        [kpi_cell(kpis['total'], "TOTAL")[0], kpi_cell(kpis['resolvidos'], "RESOLVIDOS", colors.HexColor("#00c853"))[0],
-         kpi_cell(kpis['sem_corr'], "PENDENTES", COR_VERM)[0], kpi_cell(f"{kpis['pct_res']:.0f}%", "RESOLUÇÃO", COR_VERDE)[0]],
-        [kpi_cell(kpis['total'], "")[1], kpi_cell(kpis['resolvidos'], "")[1],
-         kpi_cell(kpis['sem_corr'], "")[1], kpi_cell(f"{kpis['pct_res']:.0f}%", "")[1]],
-    ]
-    # Fix: rebuild as proper 2-row table
-    kpi_data = [
-        [Paragraph(str(kpis['total']), ParagraphStyle('k1', fontName='Helvetica-Bold', fontSize=24, textColor=COR_PRIM, alignment=TA_CENTER)),
-         Paragraph(str(kpis['resolvidos']), ParagraphStyle('k2', fontName='Helvetica-Bold', fontSize=24, textColor=colors.HexColor("#00c853"), alignment=TA_CENTER)),
-         Paragraph(str(kpis['sem_corr']), ParagraphStyle('k3', fontName='Helvetica-Bold', fontSize=24, textColor=COR_VERM, alignment=TA_CENTER)),
-         Paragraph(f"{kpis['pct_res']:.0f}%", ParagraphStyle('k4', fontName='Helvetica-Bold', fontSize=24, textColor=COR_VERDE, alignment=TA_CENTER))],
-        [Paragraph("Total", st['kpi_label']),
-         Paragraph("Resolvidos", st['kpi_label']),
-         Paragraph("Pendentes", st['kpi_label']),
+        [Paragraph(str(kpis['total']),         ParagraphStyle('k1', fontName='Helvetica-Bold', fontSize=24, textColor=COR_PRIM,                           alignment=TA_CENTER)),
+         Paragraph(str(kpis['resolvidos']),     ParagraphStyle('k2', fontName='Helvetica-Bold', fontSize=24, textColor=colors.HexColor("#00c853"),         alignment=TA_CENTER)),
+         Paragraph(str(kpis['sem_corr']),       ParagraphStyle('k3', fontName='Helvetica-Bold', fontSize=24, textColor=COR_VERM,                           alignment=TA_CENTER)),
+         Paragraph(f"{kpis['pct_res']:.0f}%",  ParagraphStyle('k4', fontName='Helvetica-Bold', fontSize=24, textColor=COR_VERDE,                          alignment=TA_CENTER))],
+        [Paragraph("Total",          st['kpi_label']),
+         Paragraph("Resolvidos",     st['kpi_label']),
+         Paragraph("Pendentes",      st['kpi_label']),
          Paragraph("Taxa Resolução", st['kpi_label'])],
     ]
-    quarter = largura / 4
     kpi_table = Table(kpi_data, colWidths=[quarter]*4, rowHeights=[12*mm, 6*mm])
     kpi_table.setStyle(TableStyle([
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('ALIGN',  (0,0), (-1,-1), 'CENTER'),
-        ('BOX',    (0,0), (-1,-1), 0.5, COR_CINZA_M),
+        ('VALIGN',    (0,0), (-1,-1), 'MIDDLE'),
+        ('ALIGN',     (0,0), (-1,-1), 'CENTER'),
+        ('BOX',       (0,0), (-1,-1), 0.5, COR_CINZA_M),
         ('INNERGRID', (0,0), (-1,-1), 0.5, COR_CINZA_L),
-        ('BACKGROUND', (0,0), (-1,0), COR_CINZA_L),
-        ('TOPPADDING', (0,0), (-1,-1), 4),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('BACKGROUND',(0,0), (-1,0),  COR_CINZA_L),
+        ('TOPPADDING',(0,0), (-1,-1), 4),
+        ('BOTTOMPADDING',(0,0),(-1,-1),4),
     ]))
 
-    # Seções de Análise
-    secoes_texto = [
-        ("2. Resumo Executivo",                    analise['resumo']),
-        ("3. Segmentação: Segurança vs Qualidade", analise['segmentacao']),
-        ("5. Tendência Temporal",                  analise['tendencia']),
-        ("6. SLA / Tempo de Resposta (MTTR)",      analise['sla']),
-        ("7. Análise de Causa Raiz",               analise['causa_raiz']),
-    ]
-
-    # Estilo de tabela genérico
-    def get_table_style():
-        return TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), COR_PRIM),
-            ('TEXTCOLOR',  (0,0), (-1,0), BRANCO),
-            ('FONTNAME',   (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE',   (0,0), (-1,0), 9),
-            ('ALIGN',      (0,0), (-1,0), 'CENTER'),
-            ('VALIGN',     (0,0), (-1,-1), 'MIDDLE'),
-            ('GRID',       (0,0), (-1,-1), 0.5, COR_CINZA_M),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [BRANCO, COR_CINZA_L]),
-            ('FONTSIZE',   (0,1), (-1,-1), 8),
-        ])
-
-    # Seção 2 — Resumo Executivo
+    # ── Seção 2 — Resumo Executivo ──
     story.append(KeepTogether([
-        Paragraph(secoes_texto[0][0], st['subtitulo']),
-        Paragraph(secoes_texto[0][1], st['corpo']),
+        Paragraph("2. Resumo Executivo", st['subtitulo']),
+        Paragraph(analise['resumo'], st['corpo']),
         Spacer(1, 2*mm)
     ]))
-
-    # KPIs ao final do texto do Resumo Executivo
     story.append(kpi_table)
     story.append(Spacer(1, 6*mm))
 
-    # Seção 3 — Segmentação (antes do gráfico de categorias)
+    # ── Seção 3 — Segmentação ──
     story.append(KeepTogether([
-        Paragraph(secoes_texto[1][0], st['subtitulo']),
-        Paragraph(secoes_texto[1][1], st['corpo']),
+        Paragraph("3. Segmentação: Segurança vs Qualidade", st['subtitulo']),
+        Paragraph(analise['segmentacao'], st['corpo']),
         Spacer(1, 2*mm)
     ]))
 
-    # ── Seção 4 — Mini Gráficos de Barras por Categoria/Subcategoria ──
+    # ── Seção 4 — Categorias ──
     story.append(Paragraph("4. Análise por Categoria e Subcategorias", st['subtitulo']))
     story.append(Paragraph(analise['cat_intro'], st['corpo']))
     story.append(Spacer(1, 3*mm))
@@ -1422,104 +1311,101 @@ def gerar_relatorio_analitico(arquivo_jsonl, pasta_base, data_str, data_impressa
     story.append(Paragraph(analise['cat_resumo'], st['corpo']))
     story.append(Spacer(1, 2*mm))
 
-    # Seções 5 em diante (texto)
-    for titulo_sec, conteudo in secoes_texto[2:]:
-        # Especial para Causa Raiz: Introdução e Conclusão
-        if "7. Análise de Causa Raiz" in titulo_sec:
-            sec_story = [
-                Paragraph(titulo_sec, st['subtitulo']),
-                Paragraph(analise.get('causa_raiz_intro', ''), st['corpo']),
-                Spacer(1, 4*mm),
-                Paragraph(conteudo, st['corpo']),
-                Spacer(1, 4*mm),
-                # Paragraph(analise.get('causa_raiz_conclusao', ''), st['corpo']), # Removido
-                Spacer(1, 2*mm)
-            ]
-        else:
-            sec_story = [
-                Paragraph(titulo_sec, st['subtitulo']),
-                Paragraph(conteudo, st['corpo'])
-            ]
-        
-        if "5. Tendência Temporal" in titulo_sec:
-            for fl in montar_grafico_tendencia(df, largura):
-                sec_story.append(fl)
+    def get_table_style():
+        return TableStyle([
+            ('BACKGROUND',    (0,0), (-1,0), COR_PRIM),
+            ('TEXTCOLOR',     (0,0), (-1,0), BRANCO),
+            ('FONTNAME',      (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE',      (0,0), (-1,0), 9),
+            ('ALIGN',         (0,0), (-1,0), 'CENTER'),
+            ('VALIGN',        (0,0), (-1,-1), 'MIDDLE'),
+            ('GRID',          (0,0), (-1,-1), 0.5, COR_CINZA_M),
+            ('ROWBACKGROUNDS',(0,1), (-1,-1), [BRANCO, COR_CINZA_L]),
+            ('FONTSIZE',      (0,1), (-1,-1), 8),
+        ])
 
-        # Especial para SLA: Tabelas de MTTR e pendências antigas
-        if "6. SLA" in titulo_sec:
-            st_tbl_preto_sla = ParagraphStyle('tbl_preto_sla', fontName='Helvetica', fontSize=7,
-                                              textColor=colors.HexColor("#000000"), alignment=TA_CENTER)
-            # MTTR por Categoria
-            if analise.get('sla_cat_data'):
-                sec_story.append(Spacer(1, 4*mm))
-                sec_story.append(Paragraph("<b>MTTR por Categoria (mais lentas):</b>", st['destaque']))
-                t_cat = [["Categoria", "Média", "Mediana", "Qtd", "Status"]]
-                for item in analise['sla_cat_data']:
-                    st_txt = item['Status']
-                    if st_txt == "Crítico":
-                        st_txt = f"<font color='#ff5252'>{st_txt}</font>"
-                    t_cat.append([
-                        Paragraph(item['Categoria'], st_tbl_preto_sla),
-                        item['Média'], item['Mediana'], str(item['Qtd']),
-                        Paragraph(st_txt, st['rodape'])
-                    ])
-                tab_cat = Table(t_cat, colWidths=[largura*0.4, largura*0.15, largura*0.15, largura*0.1, largura*0.2])
-                tab_cat.setStyle(get_table_style())
-                sec_story.append(tab_cat)
+    # ── Seção 5 — Tendência Temporal ──
+    sec5 = [
+        Paragraph("5. Tendência Temporal", st['subtitulo']),
+        Paragraph(analise['tendencia'], st['corpo']),
+    ]
+    for fl in montar_grafico_tendencia(df, largura):
+        sec5.append(fl)
+    sec5.append(Spacer(1, 2*mm))
+    story.append(KeepTogether(sec5))
 
-            # MTTR por Grupo
-            if analise.get('sla_grp_data'):
-                sec_story.append(Spacer(1, 4*mm))
-                sec_story.append(Paragraph("<b>MTTR por Grupo/Empreiteira (mais lentas):</b>", st['destaque']))
-                t_grp = [["Grupo/Empreiteira", "Média", "Mediana", "Qtd", "Status"]]
-                for item in analise['sla_grp_data']:
-                    st_txt = item['Status']
-                    if st_txt == "Crítico":
-                        st_txt = f"<font color='#ff5252'>{st_txt}</font>"
-                    t_grp.append([
-                        Paragraph(item['Grupo'], st_tbl_preto_sla),
-                        item['Média'], item['Mediana'], str(item['Qtd']),
-                        Paragraph(st_txt, st['rodape'])
-                    ])
-                tab_grp = Table(t_grp, colWidths=[largura*0.4, largura*0.15, largura*0.15, largura*0.1, largura*0.2])
-                tab_grp.setStyle(get_table_style())
-                sec_story.append(tab_grp)
+    # ── Seção 6 — SLA ──
+    st_tbl_preto_sla = ParagraphStyle('tbl_p_sla', fontName='Helvetica', fontSize=7,
+                                      textColor=colors.HexColor("#000000"), alignment=TA_CENTER)
+    sec6 = [
+        Paragraph("6. SLA / Tempo de Resposta (MTTR)", st['subtitulo']),
+        Paragraph(analise['sla'], st['corpo']),
+    ]
+    if analise.get('sla_cat_data'):
+        sec6.append(Spacer(1, 4*mm))
+        sec6.append(Paragraph("<b>MTTR por Categoria (mais lentas):</b>", st['destaque']))
+        t_cat = [["Categoria", "Média", "Mediana", "Qtd", "Status"]]
+        for item in analise['sla_cat_data']:
+            st_txt = f"<font color='#ff5252'>{item['Status']}</font>" if item['Status'] == "Crítico" else item['Status']
+            t_cat.append([
+                Paragraph(item['Categoria'], st_tbl_preto_sla),
+                item['Média'], item['Mediana'], str(item['Qtd']),
+                Paragraph(st_txt, st['rodape'])
+            ])
+        tab_cat = Table(t_cat, colWidths=[largura*0.4, largura*0.15, largura*0.15, largura*0.1, largura*0.2])
+        tab_cat.setStyle(get_table_style())
+        sec6.append(tab_cat)
 
-            # Tabela de pendências antigas
-            if analise.get('top_antigos'):
-                sec_story.append(Spacer(1, 4*mm))
-                sec_story.append(Paragraph("<b>Os 20 apontamentos pendentes mais antigos:</b>", st['destaque']))
-                
-                st_tbl_preto = ParagraphStyle('tbl_preto', fontName='Helvetica', fontSize=7,
-                                              textColor=colors.HexColor("#000000"), alignment=TA_CENTER)
-                t_data = [["ID", "Dias", "Categoria", "Defeito", "Localização"]]
-                for item in analise['top_antigos']:
-                    t_data.append([
-                        str(item['ID']),
-                        str(item['Dias']),
-                        Paragraph(item['Categoria'][:30], st_tbl_preto),
-                        Paragraph(item['Defeito'][:30], st_tbl_preto),
-                        Paragraph(item['Local'][:30], st_tbl_preto)
-                    ])
-                
-                tab = Table(t_data, colWidths=[largura*0.1, largura*0.1, largura*0.25, largura*0.25, largura*0.3], repeatRows=1)
-                tab.setStyle(get_table_style())
-                sec_story.append(tab)
+    if analise.get('sla_grp_data'):
+        sec6.append(Spacer(1, 4*mm))
+        sec6.append(Paragraph("<b>MTTR por Grupo/Empresa (mais lentas):</b>", st['destaque']))
+        t_grp = [["Grupo/Empresa", "Média", "Mediana", "Qtd", "Status"]]
+        for item in analise['sla_grp_data']:
+            st_txt = f"<font color='#ff5252'>{item['Status']}</font>" if item['Status'] == "Crítico" else item['Status']
+            t_grp.append([
+                Paragraph(item['Grupo'], st_tbl_preto_sla),
+                item['Média'], item['Mediana'], str(item['Qtd']),
+                Paragraph(st_txt, st['rodape'])
+            ])
+        tab_grp = Table(t_grp, colWidths=[largura*0.4, largura*0.15, largura*0.15, largura*0.1, largura*0.2])
+        tab_grp.setStyle(get_table_style())
+        sec6.append(tab_grp)
 
-        sec_story.append(Spacer(1, 2*mm))
-        story.append(KeepTogether(sec_story))
+    if analise.get('top_antigos'):
+        st_tbl_preto = ParagraphStyle('tbl_p', fontName='Helvetica', fontSize=7,
+                                      textColor=colors.HexColor("#000000"), alignment=TA_CENTER)
+        sec6.append(Spacer(1, 4*mm))
+        sec6.append(Paragraph("<b>Os 20 apontamentos pendentes mais antigos:</b>", st['destaque']))
+        t_data = [["ID", "Dias", "Categoria", "Defeito", "Localização"]]
+        for item in analise['top_antigos']:
+            t_data.append([
+                str(item['ID']), str(item['Dias']),
+                Paragraph(item['Categoria'][:30], st_tbl_preto),
+                Paragraph(item['Defeito'][:30],   st_tbl_preto),
+                Paragraph(item['Local'][:30],     st_tbl_preto)
+            ])
+        tab = Table(t_data,
+                    colWidths=[largura*0.1, largura*0.1, largura*0.25, largura*0.25, largura*0.3],
+                    repeatRows=1)
+        tab.setStyle(get_table_style())
+        sec6.append(tab)
 
-    # ── Conclusão Final ──
+    sec6.append(Spacer(1, 2*mm))
+    story.append(KeepTogether(sec6))
+
+    # ── Seção 7 — Causa Raiz ──
+    story.append(KeepTogether([
+        Paragraph("7. Análise de Causa Raiz", st['subtitulo']),
+        Paragraph(analise.get('causa_raiz_intro', ''), st['corpo']),
+        Spacer(1, 4*mm),
+        Paragraph(analise['causa_raiz'], st['corpo']),
+        Spacer(1, 2*mm)
+    ]))
+
+    # ── Seção 8 — Conclusão ──
     story.append(PageBreak())
     story.append(Paragraph("8. Conclusão", st['subtitulo']))
-    conclusao = gerar_conclusao(analise, kpis, nome_proj)
-    # Remover o sufixo automático se o texto veio do LLM (identificado se não tiver a marcação de rodapé)
-    # Mas como o LLM não gera a marcação, apenas usamos o texto.
-    
-    story.append(Paragraph(conclusao, st['corpo']))
-    
-    # Adicionar disclaimer discreto apenas se NÃO for LLM (opcional, mas o usuário pediu para não ter marca de IA, então não adicionamos nada extra)
-    
+    story.append(Paragraph(gerar_conclusao(analise, kpis, nome_proj), st['corpo']))
     story.append(Spacer(1, 10*mm))
     story.append(HRFlowable(width="100%", thickness=1.5, color=COR_VERDE, spaceAfter=4*mm))
     story.append(Paragraph(
@@ -1528,40 +1414,35 @@ def gerar_relatorio_analitico(arquivo_jsonl, pasta_base, data_str, data_impressa
                         textColor=COR_CINZA_M, alignment=TA_CENTER)
     ))
 
-    doc.build(story, onFirstPage=_on_cover(nome_proj, data_impressao),
+    doc.build(story,
+              onFirstPage=_on_cover(nome_proj, data_impressao),
               onLaterPages=_on_page(nome_proj, data_impressao))
-    
-    # Otimização pós-geração (PyPDF2)
+
     otimizar_pdf_final(caminho_pdf)
-    
     print(f"  [OK] {nome_proj}: {len(dados)} apontamentos -> {caminho_pdf}")
 
-    # Gerar Word (.docx)
-    if 'Document' in globals():
+    # FIX: usar flag booleana em vez de 'Document' in globals()
+    if DOCX_DISPONIVEL:
         gerar_docx_analitico(df, analise, kpis, nome_proj, pasta_out, data_impressao)
 
-# ─── Gerar Arquivo Word (DOCX) ──────────────────────────────────────────────
+
+# ─── Gerar Arquivo Word (DOCX) ────────────────────────────────────────────────
 def gerar_docx_analitico(df, analise, kpis, nome_proj, pasta_out, data_impressao):
-    """Gera uma versão Word do relatório analítico."""
     try:
         doc = Document()
-        
-        # Título
+
         t = doc.add_heading(f"Relatório Analítico — {nome_proj}", 0)
         t.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
         doc.add_paragraph(f"Gerado em: {data_impressao}").alignment = WD_ALIGN_PARAGRAPH.CENTER
         doc.add_page_break()
-        
-        # 1. Objetivo
+
         doc.add_heading("1. Objetivo", level=1)
         doc.add_paragraph(
             f"Este relatório tem como objetivo apresentar uma análise detalhada dos "
             f"apontamentos de qualidade e segurança registrados no projeto {nome_proj}, "
             f"identificados através da plataforma SnagR."
         )
-        
-        # Resumo de KPIs
+
         doc.add_heading("KPIs Globais", level=2)
         table = doc.add_table(rows=1, cols=4)
         table.style = 'Table Grid'
@@ -1570,51 +1451,54 @@ def gerar_docx_analitico(df, analise, kpis, nome_proj, pasta_out, data_impressao
         hdr_cells[1].text = 'RESOLVIDOS'
         hdr_cells[2].text = 'PENDENTES'
         hdr_cells[3].text = 'RESOLUÇÃO'
-        
         row_cells = table.add_row().cells
         row_cells[0].text = str(kpis['total'])
         row_cells[1].text = str(kpis['resolvidos'])
         row_cells[2].text = str(kpis['sem_corr'])
         row_cells[3].text = f"{kpis['pct_res']:.1f}%"
-        
-        # Seções de texto
+
         secoes = [
-            ("2. Resumo Executivo", analise['resumo']),
+            ("2. Resumo Executivo",                    analise['resumo']),
             ("3. Segmentação: Segurança vs Qualidade", analise['segmentacao']),
-            ("4. Análise por Categoria e Subcategorias", "Ver detalhes no PDF para visualização gráfica."),
-            ("5. Tendência Temporal", analise['tendencia']),
-            ("6. SLA / Tempo de Resposta (MTTR)", analise['sla']),
-            ("7. Análise de Causa Raiz", analise['causa_raiz']),
-            ("8. Conclusão", gerar_conclusao(analise, kpis, nome_proj))
+            ("4. Análise por Categoria",               "Ver detalhes no PDF para visualização gráfica."),
+            ("5. Tendência Temporal",                  analise['tendencia']),
+            ("6. SLA / Tempo de Resposta (MTTR)",      analise['sla']),
+            ("7. Análise de Causa Raiz",               analise['causa_raiz']),
+            ("8. Conclusão",                           gerar_conclusao(analise, kpis, nome_proj))
         ]
-        
+
         for titulo, conteudo in secoes:
             doc.add_heading(titulo, level=1)
-            # Limpar tags HTML básicas que podem estar no texto
-            txt = conteudo.replace("<b>", "").replace("</b>", "").replace("<br/>", "\n").replace("<i>", "").replace("</i>", "").replace("<font color='#ff5252'>", "").replace("</font>", "")
+            txt = (conteudo
+                   .replace("<b>", "").replace("</b>", "")
+                   .replace("<br/>", "\n").replace("<i>", "").replace("</i>", "")
+                   .replace("<font color='#ff5252'>", "").replace("</font>", ""))
             doc.add_paragraph(txt)
-            
-            # Adicionar tabelas de SLA se for a seção 6
+
             if "6. SLA" in titulo:
                 if analise.get('sla_cat_data'):
                     doc.add_heading("MTTR por Categoria", level=2)
                     t_cat = doc.add_table(rows=1, cols=5)
                     t_cat.style = 'Table Grid'
                     h = t_cat.rows[0].cells
-                    h[0].text, h[1].text, h[2].text, h[3].text, h[4].text = "Categoria", "Média", "Mediana", "Qtd", "Status"
+                    h[0].text, h[1].text, h[2].text, h[3].text, h[4].text = \
+                        "Categoria", "Média", "Mediana", "Qtd", "Status"
                     for item in analise['sla_cat_data']:
                         r = t_cat.add_row().cells
-                        r[0].text, r[1].text, r[2].text, r[3].text, r[4].text = item['Categoria'], item['Média'], item['Mediana'], str(item['Qtd']), item['Status']
-                
+                        r[0].text, r[1].text, r[2].text, r[3].text, r[4].text = \
+                            item['Categoria'], item['Média'], item['Mediana'], str(item['Qtd']), item['Status']
+
                 if analise.get('top_antigos'):
                     doc.add_heading("Os 20 itens mais antigos", level=2)
                     t_ant = doc.add_table(rows=1, cols=5)
                     t_ant.style = 'Table Grid'
                     h = t_ant.rows[0].cells
-                    h[0].text, h[1].text, h[2].text, h[3].text, h[4].text = "ID", "Dias", "Categoria", "Defeito", "Local"
+                    h[0].text, h[1].text, h[2].text, h[3].text, h[4].text = \
+                        "ID", "Dias", "Categoria", "Defeito", "Local"
                     for item in analise['top_antigos']:
                         r = t_ant.add_row().cells
-                        r[0].text, r[1].text, r[2].text, r[3].text, r[4].text = str(item['ID']), str(item['Dias']), item['Categoria'], item['Defeito'], item['Local']
+                        r[0].text, r[1].text, r[2].text, r[3].text, r[4].text = \
+                            str(item['ID']), str(item['Dias']), item['Categoria'], item['Defeito'], item['Local']
 
         caminho_docx = os.path.join(pasta_out, f"{nome_proj}_Relatorio_Analitico.docx")
         doc.save(caminho_docx)
@@ -1622,13 +1506,14 @@ def gerar_docx_analitico(df, analise, kpis, nome_proj, pasta_out, data_impressao
     except Exception as e:
         print(f"  [ERRO] Falha ao gerar Word: {e}")
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 58)
-    print("  GERADOR DE RELATORIO ANALITICO - SnagR (IA Nativa)")
+    print("  GERADOR DE RELATORIO ANALITICO - SnagR")
     print("=" * 58)
 
-    agora = datetime.now()
+    agora    = datetime.now()
     data_str = agora.strftime("%Y-%m-%d_%H-%M")
     data_imp = agora.strftime("%d/%m/%Y %H:%M")
 
@@ -1637,16 +1522,17 @@ def main():
 
     arquivos = sorted(glob.glob("*.jsonl"))
     if not arquivos:
-        print("ERRO: Nenhum .jsonl encontrado!")
+        print("ERRO: Nenhum .jsonl encontrado no diretório atual!")
         return
 
-    print(f"  {len(arquivos)} projeto(s). Gerando relatórios analíticos...\n")
+    print(f"  {len(arquivos)} projeto(s) encontrado(s). Gerando relatórios...\n")
     for arq in arquivos:
         print(f"\n  [{os.path.splitext(os.path.basename(arq))[0]}] Iniciando...")
         gerar_relatorio_analitico(arq, pasta_base, data_str, data_imp)
 
     print(f"\n  Salvos em: {pasta_base}")
     print("=" * 58)
+
 
 if __name__ == "__main__":
     try:
