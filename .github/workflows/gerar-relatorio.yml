@@ -9,6 +9,7 @@ on:
 
 env:
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # 👈 Adicionado para usar Node 24
 
 jobs:
   generate-report:
@@ -16,10 +17,10 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4  # Versão atualizada
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5  # Versão atualizada
       with:
         python-version: '3.10'
         cache: 'pip'
@@ -29,21 +30,4 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run analysis script
-      run: |
-        cd src
-        python 6-RELATORIO_ANALITICO.py
-
-    - name: Upload reports as artifacts
-      uses: actions/upload-artifact@v3
-      with:
-        name: relatorios-gerados
-        path: relatorios_analiticos/
-
-    - name: Commit and push generated reports
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add .
-        git commit -m "Atualizar relatórios gerados" || echo "Nenhuma mudança para commitar"
-        git push
+    - name: Run analysis**
