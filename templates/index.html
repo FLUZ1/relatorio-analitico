@@ -1,1 +1,29 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relatório Analítico</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Relatório Analítico de Apontamentos</h1>
+        
+        <div class="upload-section">
+            <h2>📤 Upload de Dados</h2>
+            <p>Arraste arquivos .jsonl ou clique para selecionar:</p>
+            <input type="file" id="fileInput" accept=".jsonl" multiple>
+            <button id="uploadBtn">Enviar Arquivos</button>
+            <div id="status"></div>
+        </div>
 
+        <div class="reports-section">
+            <h2>📄 Relatórios Gerados</h2>
+            <div id="reportsList"></div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
